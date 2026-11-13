@@ -1,0 +1,135 @@
+@import "tailwindcss";
+
+/* `dark:` follows the theme toggle (a class on <html>), not just the system setting. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme inline {
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+  --color-page: var(--page);
+  --color-surface: var(--surface);
+}
+
+/* Light theme (default). Components use the stone scale for neutrals, `surface` for cards and
+   inputs, and `page` for the background behind them. */
+:root {
+  --page: #f5f4f0;
+  --surface: #ffffff;
+  color-scheme: light;
+}
+
+/* Dark theme: the stone scale is flipped so every "stone-900 text on white" stays readable,
+   and the pale accent tints become translucent. Set by the theme toggle (class on <html>). */
+:root.dark {
+  --page: #0c0c0e;
+  --surface: #17171a;
+  color-scheme: dark;
+
+  --color-stone-50: #1e1e22;
+  --color-stone-100: #242428;
+  --color-stone-200: #303036;
+  --color-stone-300: #3f3f46;
+  --color-stone-400: #66666f;
+  --color-stone-500: #9a9aa3;
+  --color-stone-600: #b4b4bc;
+  --color-stone-700: #cfcfd6;
+  --color-stone-800: #e4e4e9;
+  --color-stone-900: #f3f3f6;
+  --color-stone-950: #fafafa;
+
+  --color-emerald-50: rgb(16 185 129 / 0.12);
+  --color-emerald-100: rgb(16 185 129 / 0.18);
+  --color-emerald-300: rgb(52 211 153 / 0.45);
+  --color-emerald-700: #6ee7b7;
+  --color-emerald-800: #a7f3d0;
+  --color-indigo-50: rgb(99 102 241 / 0.16);
+  --color-indigo-100: rgb(99 102 241 / 0.22);
+  --color-indigo-900: #c7d2fe;
+  --color-amber-50: rgb(245 158 11 / 0.12);
+  --color-amber-100: rgb(245 158 11 / 0.18);
+  --color-amber-900: #fde68a;
+  --color-rose-50: rgb(244 63 94 / 0.12);
+  --color-rose-100: rgb(244 63 94 / 0.18);
+  --color-rose-700: #fda4af;
+  --color-red-50: rgb(239 68 68 / 0.14);
+  --color-red-300: rgb(248 113 113 / 0.5);
+  --color-red-600: #f87171;
+  --color-red-700: #fca5a5;
+}
+
+/* No colour transitions while the page first loads, so the theme never animates in. */
+html.theme-loading * {
+  transition: none !important;
+}
+
+html {
+  scroll-behavior: smooth;
+  -webkit-tap-highlight-color: transparent;
+}
+
+body {
+  background: var(--page);
+  overflow-x: hidden;
+}
+
+/* Number inputs: no spinners, they only get in the way on a phone. */
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type="number"] {
+  -moz-appearance: textfield;
+}
+
+dialog::backdrop {
+  background: rgb(12 12 14 / 0.45);
+  backdrop-filter: blur(2px);
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.animate-toast-in {
+  animation: toast-in 180ms ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Printing gives a clean statement: no navigation, buttons or input forms. */
+@media print {
+  :root,
+  :root.dark {
+    --page: #fff;
+    --surface: #fff;
+    color-scheme: light;
+  }
+  header,
+  nav,
+  form,
+  button,
+  [data-print-hide] {
+    display: none !important;
+  }
+  section {
+    box-shadow: none !important;
+    break-inside: avoid;
+  }
+}

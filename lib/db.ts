@@ -1,122 +1,143 @@
-import { Pool, types } from "pg";
-
-const DATABASE_URL = process.env.DATABASE_URL ?? "postgres://postgres@127.0.0.1:5432/khatabook";
+import { MongoClient, ObjectId, type Collection, type Db } from "mongodb";
 
 export type Part = "home" | "mine";
 
-// Read NUMERIC as a JS number and DATE as a plain "YYYY-MM-DD" string.
-types.setTypeParser(types.builtins.NUMERIC, parseFloat);
-types.setTypeParser(types.builtins.DATE, (value) => value);
+/** One month: its salary and how much of it is the home part. `_id` is "YYYY-MM". */
+export interface MonthDoc {
+  _id: string;
+  salary: number;
+  homeAmount: number;
+  createdAt: Date;
+}
+
+/** A budget head inside a part, e.g. "Ration" in the home part of one month. */
+export interface HeadDoc {
+  _id: ObjectId;
+  month: string;
+  part: Part;
+  name: string;
+  planned: number;
+  /** When set, paying this head puts the money into that account instead of spending it. */
+  accountId: ObjectId | null;
+  createdAt: Date;
+}
 
 /**
- * months  – one row per month ("YYYY-MM") with the salary and the home part.
- * heads   – budget heads inside a part, e.g. "Ration" in the home part.
- * entries – the khata: every amount that went out of a part.
- * accounts – where saved / invested money goes (bank accounts, wallets, stocks).
+ * The khata: every amount that moved. Home-part payments have a month and usually a head.
+ * Savings records (expenses, loan repayments) have no month: My savings is one running view.
  */
-const SCHEMA = `
-  CREATE TABLE IF NOT EXISTS months (
-    month       text PRIMARY KEY CHECK (month ~ '^[0-9]{4}-(0[1-9]|1[0-2])$'),
-    salary      numeric(12,2) NOT NULL CHECK (salary >= 0),
-    home_amount numeric(12,2) NOT NULL CHECK (home_amount >= 0 AND home_amount <= salary),
-    created_at  timestamptz NOT NULL DEFAULT now()
-  );
-  CREATE TABLE IF NOT EXISTS heads (
-    id         integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    month      text NOT NULL REFERENCES months(month) ON DELETE CASCADE,
-    part       text NOT NULL CHECK (part IN ('home', 'mine')),
-    name       text NOT NULL,
-    planned    numeric(12,2) NOT NULL DEFAULT 0 CHECK (planned >= 0),
-    created_at timestamptz NOT NULL DEFAULT now()
-  );
-  CREATE TABLE IF NOT EXISTS entries (
-    id         integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    month      text NOT NULL REFERENCES months(month) ON DELETE CASCADE,
-    part       text NOT NULL CHECK (part IN ('home', 'mine')),
-    head_id    integer REFERENCES heads(id) ON DELETE SET NULL,
-    title      text NOT NULL,
-    amount     numeric(12,2) NOT NULL CHECK (amount > 0),
-    spent_on   date NOT NULL,
-    created_at timestamptz NOT NULL DEFAULT now()
-  );
-  -- Places money is saved or invested into. Seeded once, when the table is first created.
-  DO $$ BEGIN
-    IF to_regclass('accounts') IS NULL THEN
-      CREATE TABLE accounts (
-        id         integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-        name       text NOT NULL,
-        created_at timestamptz NOT NULL DEFAULT now()
-      );
-      INSERT INTO accounts (name) VALUES ('My account'), ('Mom''s account'), ('Upstox wallet'), ('Stocks');
-    END IF;
-  END $$;
-  -- An entry with an account is money put aside there, not spent.
-  -- A head with an account sends its "Mark added" entries to that account.
-  ALTER TABLE heads   ADD COLUMN IF NOT EXISTS account_id integer REFERENCES accounts(id) ON DELETE SET NULL;
-  ALTER TABLE entries ADD COLUMN IF NOT EXISTS account_id integer REFERENCES accounts(id) ON DELETE SET NULL;
-  -- My savings: a running pool (previous savings + my part of every month) that is
-  -- distributed across the accounts flagged in_savings. "opening" is what was already
-  -- in an account before the khata started.
-  ALTER TABLE accounts ADD COLUMN IF NOT EXISTS opening numeric(14,2) NOT NULL DEFAULT 0 CHECK (opening >= 0);
-  DO $$ BEGIN
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'accounts' AND column_name = 'in_savings') THEN
-      ALTER TABLE accounts ADD COLUMN in_savings boolean NOT NULL DEFAULT true;
-      UPDATE accounts SET in_savings = false WHERE name = 'Mom''s account';
-    END IF;
-  END $$;
-  -- A loan given to someone is still my money, but shown separately as "to collect".
-  DO $$ BEGIN
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'accounts' AND column_name = 'is_loan') THEN
-      ALTER TABLE accounts ADD COLUMN is_loan boolean NOT NULL DEFAULT false;
-      UPDATE accounts SET is_loan = true WHERE in_savings AND name ILIKE '%loan%';
-    END IF;
-  END $$;
-  -- Where a savings entry was taken from; NULL means the not-yet-distributed savings.
-  ALTER TABLE entries ADD COLUMN IF NOT EXISTS from_account_id integer REFERENCES accounts(id) ON DELETE SET NULL;
-  ALTER TABLE accounts DROP CONSTRAINT IF EXISTS accounts_opening_check;
-  -- My savings is one running view, so its records (expenses, repayments) have no month.
-  ALTER TABLE entries ALTER COLUMN month DROP NOT NULL;
-  -- Login: one-time 6-digit codes (stored hashed) and one session per signed-in device.
-  CREATE TABLE IF NOT EXISTS login_codes (
-    id         integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    code_hash  text NOT NULL,
-    attempts   integer NOT NULL DEFAULT 0,
-    used       boolean NOT NULL DEFAULT false,
-    created_at timestamptz NOT NULL DEFAULT now(),
-    expires_at timestamptz NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS sessions (
-    id         integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    token_hash text NOT NULL UNIQUE,
-    user_agent text,
-    created_at timestamptz NOT NULL DEFAULT now(),
-    last_seen  timestamptz NOT NULL DEFAULT now(),
-    expires_at timestamptz NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS settings (key text PRIMARY KEY, value numeric(14,2) NOT NULL);
-  CREATE INDEX IF NOT EXISTS heads_month_idx ON heads(month);
-  CREATE INDEX IF NOT EXISTS entries_month_idx ON entries(month);
-`;
+export interface EntryDoc {
+  _id: ObjectId;
+  month: string | null;
+  part: Part;
+  headId: ObjectId | null;
+  /** Taken out of this account. */
+  fromAccountId: ObjectId | null;
+  /** Put into this account; null means spent. */
+  accountId: ObjectId | null;
+  title: string;
+  amount: number;
+  /** YYYY-MM-DD */
+  date: string;
+  createdAt: Date;
+}
 
-// Reuse one pool across hot reloads in dev.
-const globalForPg = globalThis as unknown as {
-  _khata?: { pool: Pool; ready: Promise<void> | null };
-};
+/** Where money is kept: savings accounts, loans given (to collect), and home accounts. */
+export interface AccountDoc {
+  _id: ObjectId;
+  name: string;
+  /** Balance before any recorded movement (set directly when the balance is edited). */
+  opening: number;
+  /** Counts toward My savings (false for home accounts such as Mom's account). */
+  inSavings: boolean;
+  /** Money lent to someone, still to be collected. */
+  isLoan: boolean;
+  createdAt: Date;
+}
 
-/** Connection pool, with the tables created on first use. */
-export async function db(): Promise<Pool> {
-  const state = (globalForPg._khata ??= {
-    pool: new Pool({ connectionString: DATABASE_URL, connectionTimeoutMillis: 3000 }),
-    ready: null,
-  });
-  if (!state.ready) {
-    const ready = state.pool.query(SCHEMA).then(() => undefined);
-    state.ready = ready;
-    // If the server is down, forget the failed attempt so the next request retries.
-    ready.catch(() => {
-      if (state.ready === ready) state.ready = null;
+/** One signed-in device. Only a hash of its cookie token is stored. */
+export interface SessionDoc {
+  _id: ObjectId;
+  tokenHash: string;
+  userAgent: string | null;
+  createdAt: Date;
+  lastSeen: Date;
+  expiresAt: Date;
+}
+
+/** A 6-digit sign-in code, stored hashed. */
+export interface LoginCodeDoc {
+  _id: ObjectId;
+  codeHash: string;
+  attempts: number;
+  used: boolean;
+  createdAt: Date;
+  expiresAt: Date;
+}
+
+export interface Collections {
+  months: Collection<MonthDoc>;
+  heads: Collection<HeadDoc>;
+  entries: Collection<EntryDoc>;
+  accounts: Collection<AccountDoc>;
+  sessions: Collection<SessionDoc>;
+  loginCodes: Collection<LoginCodeDoc>;
+}
+
+function collections(database: Db): Collections {
+  return {
+    months: database.collection<MonthDoc>("months"),
+    heads: database.collection<HeadDoc>("heads"),
+    entries: database.collection<EntryDoc>("entries"),
+    accounts: database.collection<AccountDoc>("accounts"),
+    sessions: database.collection<SessionDoc>("sessions"),
+    loginCodes: database.collection<LoginCodeDoc>("loginCodes"),
+  };
+}
+
+async function ensureIndexes(c: Collections) {
+  await Promise.all([
+    c.heads.createIndex({ month: 1, createdAt: 1 }),
+    c.entries.createIndex({ month: 1 }),
+    c.entries.createIndex({ headId: 1 }),
+    c.entries.createIndex({ accountId: 1 }),
+    c.entries.createIndex({ fromAccountId: 1 }),
+    c.sessions.createIndex({ tokenHash: 1 }, { unique: true }),
+    // Expired sessions and day-old codes are removed by MongoDB itself.
+    c.sessions.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
+    c.loginCodes.createIndex({ createdAt: 1 }, { expireAfterSeconds: 24 * 60 * 60 }),
+  ]);
+}
+
+// One client per server process (and across hot reloads in dev / warm serverless calls).
+const globalForMongo = globalThis as unknown as { _khata?: Promise<Collections> };
+
+/** The app's collections, connected and indexed. */
+export function db(): Promise<Collections> {
+  if (!globalForMongo._khata) {
+    const uri = process.env.MONGODB_URI;
+    if (!uri) return Promise.reject(new Error("MONGODB_URI is missing from the environment (.env.local)."));
+    const pending = new MongoClient(uri, { serverSelectionTimeoutMS: 8000 })
+      .connect()
+      .then(async (client) => {
+        const c = collections(client.db(process.env.MONGODB_DB || "khatabook"));
+        await ensureIndexes(c);
+        return c;
+      });
+    globalForMongo._khata = pending;
+    // If the connection fails, forget it so the next request retries.
+    pending.catch(() => {
+      if (globalForMongo._khata === pending) globalForMongo._khata = undefined;
     });
   }
-  await state.ready;
-  return state.pool;
+  return globalForMongo._khata;
 }
+
+/** A form/URL id as an ObjectId, or null when it is not a valid one. */
+export function toId(value: unknown): ObjectId | null {
+  const s = String(value ?? "");
+  return /^[0-9a-f]{24}$/i.test(s) ? new ObjectId(s) : null;
+}
+
+/** Money is kept to the paisa; sums of floats are rounded back to 2 decimals. */
+export const money = (n: number) => Math.round(n * 100) / 100;

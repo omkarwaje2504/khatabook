@@ -15,7 +15,13 @@ export const metadata: Metadata = {
 
 export default async function LoginPage() {
   await connection();
-  if (await hasSession()) redirect("/");
+  // A device that is already signed in goes straight in. If that check fails (database or
+  // settings problem), still show the form: signing in reports the problem clearly.
+  const signedIn = await hasSession().catch((e) => {
+    console.error("[khatabook] Could not check the session:", e);
+    return false;
+  });
+  if (signedIn) redirect("/");
 
   return (
     <main id="main" className="relative flex flex-1 items-center justify-center overflow-hidden px-4 py-12">

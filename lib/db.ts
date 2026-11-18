@@ -1,7 +1,7 @@
 import { Pool, types } from "pg";
 
 /** The Neon PostgreSQL connection (pooled URL), from .env.local or the Vercel project settings. */
-const DATABASE_URL = process.env.DATABASE_URL;
+const DATABASE_URL = process.env.DATABASE_URL ?? process.env.POSTGRES_URL;
 
 export type Part = "home" | "mine";
 

@@ -30,6 +30,21 @@ function hash(value: string): string {
   return createHash("sha256").update(`${secret()}:${value}`).digest("hex");
 }
 
+/**
+ * Server settings that sign-in cannot work without, by name, so a fresh deployment
+ * (e.g. on Vercel) can say exactly what is missing instead of failing with a blank error.
+ */
+export function missingSettings(): string[] {
+  const missing: string[] = [];
+  if (!process.env.DATABASE_URL && !process.env.POSTGRES_URL) missing.push("DATABASE_URL");
+  if (!process.env.AUTH_EMAIL) missing.push("AUTH_EMAIL");
+  if (!process.env.AUTH_SECRET || process.env.AUTH_SECRET.length < 32) missing.push("AUTH_SECRET");
+  if (process.env.NODE_ENV === "production") {
+    for (const name of ["SMTP_HOST", "SMTP_USER", "SMTP_PASS"]) if (!process.env[name]) missing.push(name);
+  }
+  return missing;
+}
+
 /** True when the email or phone number typed on the login page is the owner's. */
 export function isOwner(identifier: string): boolean {
   const value = identifier.trim().toLowerCase();

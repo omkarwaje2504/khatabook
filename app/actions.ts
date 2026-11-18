@@ -1,13 +1,16 @@
 "use server";
 
-import { ObjectId } from "mongodb";
 import { revalidatePath } from "next/cache";
 import { requireSession } from "@/lib/auth";
-import { db, money, toId, type HeadDoc, type Part } from "@/lib/db";
+import { db, type Part } from "@/lib/db";
 import { defaultDateFor, isMonth, today } from "@/lib/month";
 
 // Used only for the very first month, when there is no earlier plan to copy.
-const STARTER_HEADS = ["Ration", "Recharge", "Train pass"];
+const STARTER_HEADS: { part: Part; name: string }[] = [
+  { part: "home", name: "Ration" },
+  { part: "home", name: "Recharge" },
+  { part: "home", name: "Train pass" },
+];
 
 /** Both pages read the same data, so every change refreshes all of them. */
 function refreshAll() {
@@ -17,7 +20,7 @@ function refreshAll() {
 function amount(fd: FormData, key: string): number {
   const n = Number(fd.get(key));
   if (!Number.isFinite(n) || n < 0) throw new Error(`"${key}" must be a positive number.`);
-  return money(n);
+  return Math.round(n * 100) / 100;
 }
 
 function text(fd: FormData, key: string): string {
@@ -36,25 +39,29 @@ function part(fd: FormData): Part {
   return p;
 }
 
-function id(fd: FormData, key = "id"): ObjectId {
-  const value = toId(fd.get(key));
-  if (!value) throw new Error(`Invalid ${key}.`);
-  return value;
+function id(fd: FormData, key = "id"): number {
+  const raw = String(fd.get(key) ?? "");
+  if (!/^\d{1,9}$/.test(raw)) throw new Error(`Invalid ${key}.`);
+  return Number(raw);
 }
 
 /** An optional account choice; empty means "plain expense". Returns null if the account is gone. */
-async function accountId(fd: FormData): Promise<ObjectId | null> {
+async function accountId(fd: FormData): Promise<number | null> {
   if (!fd.get("accountId")) return null;
-  const c = await db();
-  const found = await c.accounts.findOne({ _id: id(fd, "accountId") }, { projection: { _id: 1 } });
-  return found?._id ?? null;
+  const pool = await db();
+  const { rows } = await pool.query<{ id: number }>(`SELECT id FROM accounts WHERE id = $1`, [id(fd, "accountId")]);
+  return rows[0]?.id ?? null;
 }
 
 /** One of my savings accounts (including loans given), or null if it is not one. */
-async function savingsAccount(fd: FormData, key: string) {
+async function savingsAccount(fd: FormData, key: string): Promise<{ id: number; name: string } | null> {
   if (!fd.get(key)) return null;
-  const c = await db();
-  return c.accounts.findOne({ _id: id(fd, key), inSavings: true }, { projection: { _id: 1, name: 1 } });
+  const pool = await db();
+  const { rows } = await pool.query<{ id: number; name: string }>(
+    `SELECT id, name FROM accounts WHERE id = $1 AND in_savings`,
+    [id(fd, key)],
+  );
+  return rows[0] ?? null;
 }
 
 /** Account kind from a form: a savings account, a loan given, or a home account. */
@@ -77,36 +84,36 @@ export async function startMonth(fd: FormData) {
   await requireSession();
   const m = month(fd);
   const { salary, homeAmount } = split(fd);
-  const c = await db();
-
-  const created = await c.months.updateOne(
-    { _id: m },
-    { $setOnInsert: { salary, homeAmount, createdAt: new Date() } },
-    { upsert: true },
-  );
-  if (created.upsertedCount) {
-    const prev = await c.months.find({ _id: { $lt: m } }).sort({ _id: -1 }).limit(1).next();
-    const now = Date.now();
-    const heads: HeadDoc[] = prev
-      ? (await c.heads.find({ month: prev._id, part: "home" }).sort({ createdAt: 1, _id: 1 }).toArray()).map((h, i) => ({
-          _id: new ObjectId(),
-          month: m,
-          part: h.part,
-          name: h.name,
-          planned: h.planned,
-          accountId: h.accountId,
-          createdAt: new Date(now + i),
-        }))
-      : STARTER_HEADS.map((name, i) => ({
-          _id: new ObjectId(),
-          month: m,
-          part: "home" as const,
-          name,
-          planned: 0,
-          accountId: null,
-          createdAt: new Date(now + i),
-        }));
-    if (heads.length) await c.heads.insertMany(heads);
+  const client = await (await db()).connect();
+  try {
+    await client.query("BEGIN");
+    const created = await client.query(
+      `INSERT INTO months (month, salary, home_amount) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+      [m, salary, homeAmount],
+    );
+    if (created.rowCount) {
+      const prev = await client.query<{ month: string }>(
+        `SELECT month FROM months WHERE month < $1 ORDER BY month DESC LIMIT 1`,
+        [m],
+      );
+      if (prev.rows[0]) {
+        await client.query(
+          `INSERT INTO heads (month, part, name, planned, account_id)
+           SELECT $1, part, name, planned, account_id FROM heads WHERE month = $2 AND part = 'home' ORDER BY id`,
+          [m, prev.rows[0].month],
+        );
+      } else {
+        for (const head of STARTER_HEADS) {
+          await client.query(`INSERT INTO heads (month, part, name) VALUES ($1, $2, $3)`, [m, head.part, head.name]);
+        }
+      }
+    }
+    await client.query("COMMIT");
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
   }
   refreshAll();
 }
@@ -114,8 +121,8 @@ export async function startMonth(fd: FormData) {
 export async function updateSplit(fd: FormData) {
   await requireSession();
   const { salary, homeAmount } = split(fd);
-  const c = await db();
-  await c.months.updateOne({ _id: month(fd) }, { $set: { salary, homeAmount } });
+  const pool = await db();
+  await pool.query(`UPDATE months SET salary = $2, home_amount = $3 WHERE month = $1`, [month(fd), salary, homeAmount]);
   refreshAll();
 }
 
@@ -123,16 +130,14 @@ export async function addHead(fd: FormData) {
   await requireSession();
   const name = text(fd, "name");
   if (!name) throw new Error("Head needs a name.");
-  const c = await db();
-  await c.heads.insertOne({
-    _id: new ObjectId(),
-    month: month(fd),
-    part: part(fd),
+  const pool = await db();
+  await pool.query(`INSERT INTO heads (month, part, name, planned, account_id) VALUES ($1, $2, $3, $4, $5)`, [
+    month(fd),
+    part(fd),
     name,
-    planned: amount(fd, "planned"),
-    accountId: await accountId(fd),
-    createdAt: new Date(),
-  });
+    amount(fd, "planned"),
+    await accountId(fd),
+  ]);
   refreshAll();
 }
 
@@ -140,55 +145,57 @@ export async function updateHead(fd: FormData) {
   await requireSession();
   const name = text(fd, "name");
   if (!name) throw new Error("Head needs a name.");
-  const c = await db();
-  await c.heads.updateOne(
-    { _id: id(fd) },
-    { $set: { name, planned: amount(fd, "planned"), accountId: await accountId(fd) } },
-  );
+  const pool = await db();
+  await pool.query(`UPDATE heads SET name = $2, planned = $3, account_id = $4 WHERE id = $1`, [
+    id(fd),
+    name,
+    amount(fd, "planned"),
+    await accountId(fd),
+  ]);
   refreshAll();
 }
 
 /** Removes the head together with everything recorded against it. */
 export async function deleteHead(fd: FormData) {
   await requireSession();
-  const c = await db();
-  await c.entries.deleteMany({ headId: id(fd) });
-  await c.heads.deleteOne({ _id: id(fd) });
+  const pool = await db();
+  await pool.query(`DELETE FROM entries WHERE head_id = $1`, [id(fd)]);
+  await pool.query(`DELETE FROM heads WHERE id = $1`, [id(fd)]);
   refreshAll();
 }
 
 /** Takes back a "Mark paid": removes what was recorded against the head, keeps the head. */
 export async function undoHead(fd: FormData) {
   await requireSession();
-  const c = await db();
-  await c.entries.deleteMany({ headId: id(fd) });
+  const pool = await db();
+  await pool.query(`DELETE FROM entries WHERE head_id = $1`, [id(fd)]);
   refreshAll();
 }
 
 /** One-click entry for a fixed head: records whatever is still unpaid of its plan. */
 export async function payHead(fd: FormData) {
   await requireSession();
-  const c = await db();
-  const head = await c.heads.findOne({ _id: id(fd) });
-  if (!head) return;
-  const paid = await c.entries
-    .aggregate<{ total: number }>([{ $match: { headId: head._id } }, { $group: { _id: null, total: { $sum: "$amount" } } }])
-    .next();
-  const remaining = money(head.planned - (paid?.total ?? 0));
-  if (remaining <= 0) return;
+  const pool = await db();
+  const { rows } = await pool.query<{
+    month: string;
+    part: Part;
+    name: string;
+    accountId: number | null;
+    remaining: number;
+  }>(
+    `SELECT h.month, h.part, h.name, h.account_id AS "accountId",
+            h.planned - COALESCE((SELECT sum(e.amount) FROM entries e WHERE e.head_id = h.id), 0) AS remaining
+       FROM heads h WHERE h.id = $1`,
+    [id(fd)],
+  );
+  const head = rows[0];
+  if (!head || head.remaining <= 0) return;
 
-  await c.entries.insertOne({
-    _id: new ObjectId(),
-    month: head.month,
-    part: head.part,
-    headId: head._id,
-    fromAccountId: null,
-    accountId: head.accountId,
-    title: head.name,
-    amount: remaining,
-    date: defaultDateFor(head.month),
-    createdAt: new Date(),
-  });
+  await pool.query(
+    `INSERT INTO entries (month, part, head_id, account_id, title, amount, spent_on)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [head.month, head.part, id(fd), head.accountId, head.name, head.remaining, defaultDateFor(head.month)],
+  );
   refreshAll();
 }
 
@@ -208,19 +215,11 @@ export async function addExpense(fd: FormData) {
   const from = await savingsAccount(fd, "fromAccountId");
   if (!from) throw new Error("Pick the account it was paid from.");
 
-  const c = await db();
-  await c.entries.insertOne({
-    _id: new ObjectId(),
-    month: null,
-    part: "mine",
-    headId: null,
-    fromAccountId: from._id,
-    accountId: null,
-    title,
-    amount: value,
-    date: dateOrToday(fd, "date"),
-    createdAt: new Date(),
-  });
+  const pool = await db();
+  await pool.query(
+    `INSERT INTO entries (month, part, from_account_id, title, amount, spent_on) VALUES (NULL, 'mine', $1, $2, $3, $4)`,
+    [from.id, title, value, dateOrToday(fd, "date")],
+  );
   refreshAll();
 }
 
@@ -230,23 +229,18 @@ export async function repayLoan(fd: FormData) {
   const value = amount(fd, "amount");
   if (value === 0) throw new Error("Amount must be more than zero.");
 
-  const c = await db();
-  const loan = await c.accounts.findOne({ _id: id(fd), isLoan: true });
+  const pool = await db();
+  const loan = (
+    await pool.query<{ id: number; name: string }>(`SELECT id, name FROM accounts WHERE id = $1 AND is_loan`, [id(fd)])
+  ).rows[0];
   const to = await savingsAccount(fd, "toAccountId");
-  if (!loan || !to || to._id.equals(loan._id)) throw new Error("Pick the account the money came back to.");
+  if (!loan || !to || to.id === loan.id) throw new Error("Pick the account the money came back to.");
 
-  await c.entries.insertOne({
-    _id: new ObjectId(),
-    month: null,
-    part: "mine",
-    headId: null,
-    fromAccountId: loan._id,
-    accountId: to._id,
-    title: `Repaid: ${loan.name}`,
-    amount: value,
-    date: today(),
-    createdAt: new Date(),
-  });
+  await pool.query(
+    `INSERT INTO entries (month, part, from_account_id, account_id, title, amount, spent_on)
+     VALUES (NULL, 'mine', $1, $2, $3, $4, $5)`,
+    [loan.id, to.id, `Repaid: ${loan.name}`, value, today()],
+  );
   refreshAll();
 }
 
@@ -254,14 +248,14 @@ export async function addAccount(fd: FormData) {
   await requireSession();
   const name = text(fd, "name");
   if (!name) throw new Error("Account needs a name.");
-  const c = await db();
-  await c.accounts.insertOne({
-    _id: new ObjectId(),
+  const pool = await db();
+  const kind = accountKind(fd);
+  await pool.query(`INSERT INTO accounts (name, opening, in_savings, is_loan) VALUES ($1, $2, $3, $4)`, [
     name,
-    opening: fd.get("opening") ? amount(fd, "opening") : 0,
-    ...accountKind(fd),
-    createdAt: new Date(),
-  });
+    fd.get("opening") ? amount(fd, "opening") : 0,
+    kind.inSavings,
+    kind.isLoan,
+  ]);
   refreshAll();
 }
 
@@ -269,21 +263,19 @@ export async function updateAccount(fd: FormData) {
   await requireSession();
   const name = text(fd, "name");
   if (!name) throw new Error("Account needs a name.");
+  const pool = await db();
+  const kind = accountKind(fd);
   const balance = Number(fd.get("balance"));
   if (!Number.isFinite(balance)) throw new Error("Balance must be a number.");
-  const accId = id(fd);
-
-  // Store the typed balance as "opening", net of everything recorded into and out of the account.
-  const c = await db();
-  const [moved] = await c.entries
-    .aggregate<{ net: number }>([
-      { $match: { $or: [{ accountId: accId }, { fromAccountId: accId }] } },
-      { $group: { _id: null, net: { $sum: { $cond: [{ $eq: ["$accountId", accId] }, "$amount", { $multiply: ["$amount", -1] }] } } } },
-    ])
-    .toArray();
-  await c.accounts.updateOne(
-    { _id: accId },
-    { $set: { name, ...accountKind(fd), opening: money(balance - (moved?.net ?? 0)) } },
+  // Store the balance as "opening", net of everything recorded into and out of the account.
+  await pool.query(
+    `UPDATE accounts
+        SET name = $2, in_savings = $4, is_loan = $5,
+            opening = $3
+              - COALESCE((SELECT sum(amount) FROM entries WHERE account_id = $1), 0)
+              + COALESCE((SELECT sum(amount) FROM entries WHERE from_account_id = $1), 0)
+      WHERE id = $1`,
+    [id(fd), name, Math.round(balance * 100) / 100, kind.inSavings, kind.isLoan],
   );
   refreshAll();
 }
@@ -291,17 +283,15 @@ export async function updateAccount(fd: FormData) {
 /** Removes the account together with every record that moved money into or out of it. */
 export async function deleteAccount(fd: FormData) {
   await requireSession();
-  const accId = id(fd);
-  const c = await db();
-  await c.entries.deleteMany({ $or: [{ accountId: accId }, { fromAccountId: accId }] });
-  await c.heads.updateMany({ accountId: accId }, { $set: { accountId: null } });
-  await c.accounts.deleteOne({ _id: accId });
+  const pool = await db();
+  await pool.query(`DELETE FROM entries WHERE account_id = $1 OR from_account_id = $1`, [id(fd)]);
+  await pool.query(`DELETE FROM accounts WHERE id = $1`, [id(fd)]);
   refreshAll();
 }
 
 export async function deleteEntry(fd: FormData) {
   await requireSession();
-  const c = await db();
-  await c.entries.deleteOne({ _id: id(fd) });
+  const pool = await db();
+  await pool.query(`DELETE FROM entries WHERE id = $1`, [id(fd)]);
   refreshAll();
 }

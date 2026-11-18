@@ -105,7 +105,7 @@ export function DbDown({ error }: { error: string }) {
         <AlertIcon /> Can&apos;t reach the database
       </h2>
       <p className="mt-2 text-sm text-stone-600">
-        Open DBngin, start the Postgres server, then reload this page. The connection is set by{" "}
+        The database did not answer. Reload in a moment; if it keeps happening, check{" "}
         <code className="rounded bg-stone-100 px-1.5 py-0.5">DATABASE_URL</code> in{" "}
         <code className="rounded bg-stone-100 px-1.5 py-0.5">.env.local</code>.
       </p>

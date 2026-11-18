@@ -2,7 +2,7 @@ import { createHash, randomBytes, randomInt, timingSafeEqual } from "node:crypto
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import nodemailer from "nodemailer";
-import { db } from "./db";
+import { DATABASE_URL, db, isLocalDatabase } from "./db";
 
 /** Only this person can sign in; every code is emailed to OWNER_EMAIL. */
 export const OWNER_EMAIL = (process.env.AUTH_EMAIL ?? "").trim().toLowerCase();
@@ -36,7 +36,9 @@ function hash(value: string): string {
  */
 export function missingSettings(): string[] {
   const missing: string[] = [];
-  if (!process.env.DATABASE_URL && !process.env.POSTGRES_URL) missing.push("DATABASE_URL");
+  if (!DATABASE_URL) missing.push("DATABASE_URL");
+  // On a live server, a database on "this computer" is a leftover local setting.
+  else if (process.env.VERCEL && isLocalDatabase()) missing.push("DATABASE_URL (it points to 127.0.0.1; use the Neon URL)");
   if (!process.env.AUTH_EMAIL) missing.push("AUTH_EMAIL");
   if (!process.env.AUTH_SECRET || process.env.AUTH_SECRET.length < 32) missing.push("AUTH_SECRET");
   if (process.env.NODE_ENV === "production") {

@@ -1,7 +1,19 @@
 import { Pool, types } from "pg";
 
-/** The Neon PostgreSQL connection (pooled URL), from .env.local or the Vercel project settings. */
-const DATABASE_URL = process.env.DATABASE_URL ?? process.env.POSTGRES_URL;
+/**
+ * The Neon PostgreSQL connection (pooled URL). On Vercel the Neon integration provides it as
+ * STORAGE_DATABASE_URL, which wins over a hand-made DATABASE_URL; locally it comes from .env.local.
+ */
+export const DATABASE_URL =
+  process.env.STORAGE_DATABASE_URL ||
+  process.env.DATABASE_URL ||
+  process.env.STORAGE_POSTGRES_URL ||
+  process.env.POSTGRES_URL;
+
+/** True when the database address points at the machine the app runs on (fine locally, wrong on Vercel). */
+export function isLocalDatabase(url = DATABASE_URL): boolean {
+  return !!url && /@(localhost|127\.0\.0\.1|\[::1\])(:|\/)/i.test(url);
+}
 
 export type Part = "home" | "mine";
 
